@@ -5,4 +5,3 @@ Analysis of 500+ participant tutoring system interaction data using mixed-effect
 
 **Tools:** R, tidyverse, lme4, ggplot2
 **Methods:** Mixed-effects regression, behavioral coding, visualization
-```
