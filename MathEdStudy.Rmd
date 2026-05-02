@@ -1,0 +1,937 @@
+---
+title: "Negative Integer Magnitude Comparison: Adult Data Analysis"
+author: "Nick Vest"
+date: "2025-06-13"
+output: html_document
+---
+
+<!--
+========================================================================
+SCRIPT OVERVIEW
+========================================================================
+Study:        Dissertation Study 1 — Adult participants
+Task:         Magnitude comparison across three pair types
+              (Positive, Negative, Mixed) × four presentation conditions
+              (sequential-ungrouped, sequential-grouped,
+               simultaneous-ungrouped, simultaneous-grouped)
+Outcomes:     Reaction time (RT) and distance/semantic-congruence effects
+Key Analyses:
+  1. Data cleaning — error-rate exclusions, global RT cutoffs by
+     condition, per-participant SD trimming
+  2. Distance effects — group-level LMERs and individual-level beta
+     extraction with ±0.25 SD classification
+  3. Semantic Congruence Effects (SCE) — group-level and
+     individual-level analyses by comparison type and condition
+  4. Executive function exploratory analyses — working memory,
+     inhibitory control, and cognitive flexibility × distance-effect
+     profile (chi-square + proportion plots)
+Data:         all_data.csv (processed from raw JSON via dataupload.R)
+              EFData_20250628_adults.csv
+========================================================================
+-->
+
+#### CUSTOM FUNCTIONS AND PACKAGES
+
+```{r setup, message=FALSE, warning=FALSE}
+library(psych)
+library(car)
+library(tidyverse)
+library(effectsize)
+library(ggplot2)
+library(dplyr)
+library(effects)
+library(see)
+library(ggrain)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(ggpattern)
+
+# varDescribe: compact wrapper around psych::describe
+# Detail = 1 (minimal), 2 (standard), 3 (full)
+varDescribe <- function(Data, Detail = 2, Digits = 2) {
+  t3 <- psych::describe(Data)
+  t3 <- data.frame(t3)
+  if (!is.null(Digits)) t3 <- round(t3, Digits)
+  t2 <- t3[, c(1:5, 8, 9, 11, 12)]
+  t1 <- t3[, c(2:4, 8, 9)]
+  t  <- switch(Detail, t1, t2, t3)
+  return(t)
+}
+
+# varDescribeBy: varDescribe split by a grouping variable
+varDescribeBy <- function(Data, IVList) {
+  by(Data, IVList, varDescribe)
+}
+
+# varRecode: replace levels of a vector by position
+# Old and New must be equal-length vectors; NAs are preserved and flagged
+varRecode <- function(Var, Old, New) {
+  if (length(Old) != length(New))
+    stop("Number of Old and New values do not match")
+  NewVar <- rep(NA, length(Var))
+  for (i in seq_along(Old)) {
+    NewVar[Var == Old[i]] <- New[i]
+  }
+  if (sum(is.na(NewVar)) != sum(is.na(Var)))
+    warning(sprintf(
+      "%.0f NAs in original variable but %.0f NAs in recoded variable",
+      sum(is.na(Var)), sum(is.na(NewVar))
+    ))
+  if (is.factor(Var)) NewVar <- as.factor(NewVar)
+  return(NewVar)
+}
+```
+
+---
+
+#### LOADING AND CLEANING DATA
+
+```{r data-cleaning}
+d <- read.csv("/Users/vestnicholas/Documents/Projects/Integers/Dissertation/DATA/ADULTS/all_data.csv")
+# Raw: 35,520 trials
+
+d$SubID    <- d$StudentID
+d$StudentID <- NULL
+
+# --- Step 1: Remove participants with error rates > 45% ---
+d_error <- d %>%
+  group_by(SubID) %>%
+  summarise(ErrorRate = mean(Accuracy, na.rm = TRUE))
+
+exclusions <- c("2891", "2857", "9482", "4589", "3066", "3091")
+d <- filter(d, !SubID %in% exclusions)
+
+# --- Step 2: Remove inaccurate trials ---
+d <- filter(d, Accuracy != 0)
+# After accuracy filter: 28,219
+
+# --- Step 3: Global RT cutoffs by presentation condition ---
+# Sequential conditions: 50–3000 ms (allow faster manual responses)
+# Simultaneous conditions: 200–3000 ms (display requires visual search)
+d <- d %>%
+  filter(
+    (configuration %in% c("sequential-grouped", "sequential-ungrouped") &
+       RT >= 50 & RT <= 3000) |
+    (configuration %in% c("simultaneous-grouped", "simultaneous-ungrouped") &
+       RT >= 200 & RT <= 3000)
+  )
+# Trials removed by global cutoff: (28219 - 26979) / 28219 = 4.4%
+
+# --- Step 4: Per-participant SD trimming (±3 SD within SubID × Comparison_Type × condition) ---
+d <- d %>%
+  group_by(SubID, Comparison_Type, configuration) %>%
+  mutate(mean_rt = mean(RT), sd_rt = sd(RT)) %>%
+  filter(RT >= mean_rt - 3 * sd_rt, RT <= mean_rt + 3 * sd_rt) %>%
+  ungroup() %>%
+  dplyr::select(-mean_rt, -sd_rt)
+# Trials removed by SD trimming: (26979 - 26400) / 26979 = 2.1%
+# Final N: 26,400 trials
+
+# --- Contrast coding: shared across all analyses below ---
+config_levels  <- c("sequential-ungrouped", "sequential-grouped",
+                    "simultaneous-ungrouped", "simultaneous-grouped")
+order_vals     <- c(.5, -.5, .5, -.5)   # intermixed = .5, blocked = -.5
+present_vals   <- c(-.5, -.5, .5, .5)   # sequential = -.5, simultaneous = .5
+order_labels   <- c("Intermixed", "Blocked", "Intermixed", "Blocked")
+present_labels <- c("Sequential", "Sequential", "Simultaneous", "Simultaneous")
+
+d$Order            <- varRecode(d$configuration, config_levels, order_vals)
+d$Presentation     <- varRecode(d$configuration, config_levels, present_vals)
+d$Order_STR        <- varRecode(d$configuration, config_levels, order_labels)
+d$Presentation_STR <- varRecode(d$configuration, config_levels, present_labels)
+d$Predicate_C      <- varRecode(d$Choose_GL, c("Greater", "Lesser"), c(-.5, .5))
+
+# Distance centered within each Comparison_Type
+d <- d %>%
+  group_by(Comparison_Type) %>%
+  mutate(Distance_C = Distance - mean(Distance, na.rm = TRUE)) %>%
+  ungroup()
+
+# Near/Far binary for distance
+d <- d %>%
+  mutate(
+    Distance_01 = case_when(
+      Comparison_Type %in% c("Positive", "Negative") & Distance > 4 ~ "Far",
+      Comparison_Type %in% c("Positive", "Negative") & Distance <= 4 ~ "Near",
+      Comparison_Type == "Mixed" & Distance >= 6 ~ "Far",
+      Comparison_Type == "Mixed" & Distance < 6  ~ "Near",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+---
+
+#### ANALYSES: DISTANCE EFFECTS
+
+```{r distance-descriptives}
+# Overall RT by Comparison_Type
+summary_overall <- d %>%
+  group_by(Comparison_Type) %>%
+  summarize(
+    mean_RT = mean(RT, na.rm = TRUE),
+    se_RT   = sd(RT, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# RT by Comparison_Type × Near/Far
+summary_distance <- d %>%
+  group_by(Comparison_Type, Distance_01) %>%
+  summarize(
+    mean_RT = mean(RT, na.rm = TRUE),
+    se_RT   = sd(RT, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+mean_wide <- summary_distance %>%
+  select(Comparison_Type, Distance_01, mean_RT) %>%
+  pivot_wider(names_from = Distance_01, values_from = mean_RT, names_prefix = "Mean_")
+
+se_wide <- summary_distance %>%
+  select(Comparison_Type, Distance_01, se_RT) %>%
+  pivot_wider(names_from = Distance_01, values_from = se_RT, names_prefix = "SE_")
+
+summary_distance_wide <- left_join(mean_wide, se_wide, by = "Comparison_Type")
+
+# RT for Mixed pairs by condition
+summary_mixed_cond <- d %>%
+  filter(Comparison_Type == "Mixed") %>%
+  group_by(configuration) %>%
+  summarize(
+    mean_RT = mean(RT, na.rm = TRUE),
+    se_RT   = sd(RT, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# RT for Mixed pairs by condition × Near/Far
+summary_mixed_dist <- d %>%
+  filter(Comparison_Type == "Mixed") %>%
+  group_by(Comparison_Type, Distance_01, configuration) %>%
+  summarize(
+    mean_RT = mean(RT, na.rm = TRUE),
+    se_RT   = sd(RT, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+mean_wide_m <- summary_mixed_dist %>%
+  select(Comparison_Type, configuration, Distance_01, mean_RT) %>%
+  pivot_wider(names_from = Distance_01, values_from = mean_RT, names_prefix = "Mean_")
+
+se_wide_m <- summary_mixed_dist %>%
+  select(Comparison_Type, configuration, Distance_01, se_RT) %>%
+  pivot_wider(names_from = Distance_01, values_from = se_RT, names_prefix = "SE_")
+
+summary_mixed_wide <- left_join(mean_wide_m, se_wide_m, by = c("Comparison_Type", "configuration"))
+
+# RT ~ Distance by Comparison_Type
+ggplot(d, aes(x = Distance, y = RT, color = Comparison_Type)) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Distance", y = "Reaction Time (RT)", color = "Comparison Type") +
+  theme_bw()
+
+ggplot(d, aes(x = Distance, y = RT, color = Comparison_Type)) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ configuration) +
+  labs(x = "Distance", y = "Reaction Time (RT)", color = "Comparison Type") +
+  theme_bw()
+
+# RT histograms (raw and log-transformed)
+ggplot(d, aes(x = RT)) +
+  geom_histogram(binwidth = 100, fill = "skyblue", color = "black") +
+  facet_wrap(~ Comparison_Type, scales = "free_y") +
+  labs(
+    title = "Reaction Time Histograms by Comparison Type",
+    x = "Reaction Time (ms)", y = "Count"
+  ) +
+  theme_minimal()
+
+means_log <- d %>%
+  group_by(Comparison_Type) %>%
+  summarise(mean_log_rt = mean(log(RT), na.rm = TRUE))
+
+ggplot(d, aes(x = log(RT))) +
+  geom_histogram(binwidth = 0.1, fill = "skyblue", color = "black") +
+  geom_vline(data = means_log, aes(xintercept = mean_log_rt),
+             color = "red", linetype = "dashed", linewidth = 1) +
+  facet_wrap(~ Comparison_Type, scales = "free_y") +
+  labs(
+    title = "Log-Transformed RT Histograms by Comparison Type",
+    x = "Log Reaction Time", y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r distance-inferential-group}
+# ---- Group-level LMERs: RT ~ Distance × Order × Presentation ----
+
+# Helper: shared plot theme for distance effect figures
+de_plot <- function(data, title_str) {
+  ggplot(data, aes(x = Distance, y = RT, color = Order_STR)) +
+    geom_smooth(method = "lm", se = TRUE) +
+    facet_wrap(~ Presentation_STR) +
+    scale_y_continuous(limits = c(200, 3000), breaks = seq(200, 3000, by = 400)) +
+    scale_x_continuous(limits = c(1, 8), breaks = 1:8) +
+    scale_color_manual(values = c("#0072B2", "#E69F00")) +
+    labs(
+      title = title_str,
+      x = "Distance", y = "Reaction Time (ms)", color = "Order"
+    ) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+
+## Positive pairs
+d_pos <- filter(d, Comparison_Type == "Positive")
+
+m_pos <- lmer(
+  RT ~ Distance_C * Order * Presentation + Predicate_C +
+    (1 + Distance_C * Order + Predicate_C | SubID),
+  data    = d_pos,
+  control = lmerControl(optimizer = "bobyqa",
+                        optCtrl   = list(maxfun = 2e6),
+                        check.nobs.vs.nRE = "ignore")
+)
+anova(as_lmerModLmerTest(m_pos))
+summary(m_pos)
+Anova(m_pos, type = "III")
+
+de_plot(d_pos, "Positive-Positive Pairs")
+
+## Negative pairs
+d_neg <- filter(d, Comparison_Type == "Negative")
+
+m_neg <- lmer(
+  RT ~ Distance_C * Order * Presentation + Predicate_C +
+    (1 + Distance_C * Order + Predicate_C | SubID),
+  data    = d_neg,
+  control = lmerControl(optimizer = "bobyqa",
+                        optCtrl   = list(maxfun = 2e6),
+                        check.nobs.vs.nRE = "ignore")
+)
+anova(as_lmerModLmerTest(m_neg))
+summary(m_neg)
+Anova(m_neg, type = "III")
+
+de_plot(d_neg, "Negative-Negative Pairs")
+
+## Mixed pairs — omnibus
+d_mixed <- filter(d, Comparison_Type == "Mixed")
+
+m_mixed <- lmer(
+  RT ~ Distance_C * Order * Presentation + Predicate_C +
+    (1 + Distance_C:Order + Predicate_C | SubID),
+  data    = d_mixed,
+  control = lmerControl(optimizer = "nloptwrap",
+                        optCtrl   = list(maxfun = 100000),
+                        check.nobs.vs.nRE = "ignore")
+)
+anova(as_lmerModLmerTest(m_mixed))
+summary(m_mixed)
+
+de_plot(d_mixed, "Mixed Pairs")
+
+# Mixed: simple effects via re-parametrized contrasts
+# Each model shifts the reference cell to one of the four conditions
+
+## Simultaneous-Intermixed as reference
+d_mixed$Order_SI        <- varRecode(d_mixed$Order,        c(-.5, .5), c(-1, 0))
+d_mixed$Presentation_SI <- varRecode(d_mixed$Presentation, c(-.5, .5), c(-1, 0))
+m_SI <- lmer(
+  RT ~ Distance_C * Order_SI * Presentation_SI + Predicate_C +
+    (1 + Distance_C:Order + Predicate_C | SubID),
+  data    = d_mixed,
+  control = lmerControl(optimizer = "nloptwrap", optCtrl = list(maxfun = 100000),
+                        check.nobs.vs.nRE = "ignore")
+)
+summary(m_SI)
+
+## Simultaneous-Blocked as reference
+d_mixed$Order_SB        <- varRecode(d_mixed$Order,        c(-.5, .5), c(0, 1))
+d_mixed$Presentation_SB <- varRecode(d_mixed$Presentation, c(-.5, .5), c(-1, 0))
+m_SB <- lmer(
+  RT ~ Distance_C * Order_SB * Presentation_SB + Predicate_C +
+    (1 + Distance_C:Order + Predicate_C | SubID),
+  data    = d_mixed,
+  control = lmerControl(optimizer = "nloptwrap", optCtrl = list(maxfun = 100000),
+                        check.nobs.vs.nRE = "ignore")
+)
+summary(m_SB)
+
+## Sequential-Intermixed as reference
+d_mixed$Order_SQI        <- varRecode(d_mixed$Order,        c(-.5, .5), c(-1, 0))
+d_mixed$Presentation_SQI <- varRecode(d_mixed$Presentation, c(-.5, .5), c(0, 1))
+m_SQI <- lmer(
+  RT ~ Distance_C * Order_SQI * Presentation_SQI + Predicate_C +
+    (1 + Distance_C:Order + Predicate_C | SubID),
+  data    = d_mixed,
+  control = lmerControl(optimizer = "nloptwrap", optCtrl = list(maxfun = 100000),
+                        check.nobs.vs.nRE = "ignore")
+)
+summary(m_SQI)
+
+## Sequential-Blocked as reference
+d_mixed$Order_SQB        <- varRecode(d_mixed$Order,        c(-.5, .5), c(0, 1))
+d_mixed$Presentation_SQB <- varRecode(d_mixed$Presentation, c(-.5, .5), c(0, 1))
+m_SQB <- lmer(
+  RT ~ Distance_C * Order_SQB * Presentation_SQB + Predicate_C +
+    (1 + Distance_C:Order + Predicate_C | SubID),
+  data    = d_mixed,
+  control = lmerControl(optimizer = "nloptwrap", optCtrl = list(maxfun = 100000),
+                        check.nobs.vs.nRE = "ignore")
+)
+summary(m_SQB)
+```
+
+```{r distance-inferential-individual}
+# ---- Individual-level distance effects ----
+# Per-participant OLS: RT ~ Distance_C + Predicate_C
+# Extracts beta, p-value, and 95% CI for Distance_C
+# Classifies participants as Inverse / Standard / None using ±0.25 SD threshold
+
+extract_de_betas <- function(df) {
+  results <- data.frame(
+    SubID          = character(),
+    beta_Distance  = numeric(),
+    p_value        = numeric(),
+    lower_CI       = numeric(),
+    upper_CI       = numeric(),
+    stringsAsFactors = FALSE
+  )
+  for (subj in unique(df$SubID)) {
+    subj_data <- filter(df, SubID == subj)
+    model     <- lm(RT ~ Distance_C + Predicate_C, data = subj_data)
+    ci        <- confint(model, "Distance_C", level = 0.95)
+    results   <- rbind(results, data.frame(
+      SubID         = subj,
+      beta_Distance = coef(model)["Distance_C"],
+      p_value       = summary(model)$coefficients["Distance_C", "Pr(>|t|)"],
+      lower_CI      = ci[1],
+      upper_CI      = ci[2]
+    ))
+  }
+  return(results)
+}
+
+classify_de <- function(df) {
+  threshold_above <-  0.25 * SD(df$beta_Distance)
+  threshold_below <- -0.25 * SD(df$beta_Distance)
+  df %>%
+    mutate(
+      DE_.25 = case_when(
+        beta_Distance > threshold_above ~ "Inverse",
+        beta_Distance < threshold_below ~ "Standard",
+        TRUE                            ~ "None"
+      ),
+      DE_.25 = factor(DE_.25, levels = c("Inverse", "Standard", "None"))
+    )
+}
+
+## Positive
+d_pos$Predicate_C <- varRecode(d_pos$Choose_GL, c("Greater", "Lesser"), c(-.5, .5))
+de_pos <- classify_de(extract_de_betas(d_pos))
+table(de_pos$DE_.25)
+
+## Negative
+d_neg$Predicate_C <- varRecode(d_neg$Choose_GL, c("Greater", "Lesser"), c(-.5, .5))
+de_neg <- classify_de(extract_de_betas(d_neg))
+table(de_neg$DE_.25)
+
+## Mixed — overall
+d_mixed$Predicate_C <- varRecode(d_mixed$Choose_GL, c("Greater", "Lesser"), c(-.5, .5))
+de_mixed <- classify_de(extract_de_betas(d_mixed))
+table(de_mixed$DE_.25)
+
+# Scatter: individual distance betas for Mixed pairs
+ggplot(de_mixed, aes(x = factor(SubID), y = beta_Distance)) +
+  annotate("rect", xmin = -Inf, xmax = Inf,
+           ymin = -10.44, ymax = 10.44, fill = "lightgrey",  alpha = 0.5) +
+  annotate("rect", xmin = -Inf, xmax = Inf,
+           ymin = 10.44,  ymax = Inf,  fill = "lightcoral",  alpha = 0.3) +
+  annotate("rect", xmin = -Inf, xmax = Inf,
+           ymin = -Inf,   ymax = -10.44, fill = "lightgreen", alpha = 0.3) +
+  geom_point(size = 2) +
+  coord_cartesian(ylim = c(-120, 120)) +
+  labs(
+    title = "Distance Effects by Participant (Mixed Pairs)",
+    x = "Participant (SubID)", y = "Beta for Distance"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.line    = element_line(color = "black"),
+    axis.text.x  = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  )
+
+## Mixed — by condition
+conditions <- c("simultaneous-ungrouped", "simultaneous-grouped",
+                "sequential-ungrouped",   "sequential-grouped")
+
+de_mixed_by_cond <- map_dfr(conditions, function(cond) {
+  df_cond <- filter(d_mixed, configuration == cond)
+  classify_de(extract_de_betas(df_cond)) %>%
+    mutate(configuration = cond)
+})
+
+de_mixed_by_cond %>%
+  group_by(configuration) %>%
+  summarise(table = list(table(DE_.25)), .groups = "drop") %>%
+  pull(table) %>%
+  setNames(conditions)
+
+## Proportion plots: Distance Effects
+
+# Overall (Positive, Negative, Mixed)
+de_prop_overall <- data.frame(
+  Comparison = rep(c("a Positive", "b Negative", "c Mixed"), each = 3),
+  Category   = rep(c("c None", "b Standard", "a Inverse"), times = 3),
+  Proportion = c(0.15, 0.65, 0.20,
+                 0.15, 0.78, 0.07,
+                 0.24, 0.37, 0.39)
+)
+
+ggplot(de_prop_overall, aes(x = Comparison, y = Proportion, fill = Category)) +
+  geom_bar(position = "fill", stat = "identity", color = "black") +
+  geom_text(aes(label = scales::percent(Proportion, accuracy = 0.1)),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 3) +
+  labs(x = "Comparison Type", y = "Proportion") +
+  scale_fill_manual(values = c("#7A4FD9", "#C084F5", "#7A6C8A")) +
+  theme_bw(base_size = 14)
+
+# By condition (Mixed pairs only)
+de_prop_cond <- data.frame(
+  Comparison = rep(
+    c("a Simultaneous-Intermixed", "b Simultaneous-Blocked",
+      "c Sequential-Intermixed",  "d Sequential-Blocked"),
+    each = 3
+  ),
+  Category   = rep(c("c None", "b Standard", "a Inverse"), times = 4),
+  Proportion = c(0.23, 0.43, 0.33,
+                 0.20, 0.46, 0.33,
+                 0.12, 0.42, 0.46,
+                 0.21, 0.33, 0.46)
+)
+
+ggplot(de_prop_cond, aes(x = Comparison, y = Proportion, fill = Category)) +
+  geom_bar(position = "fill", stat = "identity", color = "black") +
+  geom_text(aes(label = scales::percent(Proportion, accuracy = 0.1)),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 3) +
+  labs(x = "Condition", y = "Proportion") +
+  scale_fill_manual(values = c("#7A4FD9", "#C084F5", "#7A6C8A")) +
+  theme_bw(base_size = 14)
+```
+
+---
+
+#### ANALYSES: SEMANTIC CONGRUENCE EFFECTS
+
+```{r sce-descriptives}
+# SCE analyses restricted to Positive and Negative pairs (Size is undefined for Mixed)
+d_sce <- d %>%
+  filter(Size != "", Comparison_Type != "Mixed")
+
+describeBy(d_sce$RT, d_sce$Comparison_Type)
+
+# Overall RT by Comparison_Type
+d_sce %>%
+  group_by(Comparison_Type) %>%
+  summarise(mean_RT = mean(RT, na.rm = TRUE), se_RT = sd(RT, na.rm = TRUE) / sqrt(n()))
+
+# RT by Comparison_Type × Predicate × Size
+d_sce %>%
+  group_by(Comparison_Type, Choose_GL, Size) %>%
+  summarise(mean_RT = mean(RT, na.rm = TRUE), se_RT = sd(RT, na.rm = TRUE) / sqrt(n()))
+
+# RT for Negative pairs by condition
+d_sce %>%
+  filter(Comparison_Type == "Negative") %>%
+  group_by(configuration) %>%
+  summarise(mean_RT = mean(RT, na.rm = TRUE), se_RT = sd(RT, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop")
+
+# RT for Negative pairs by condition × Predicate × Size
+d_sce %>%
+  filter(Comparison_Type == "Negative") %>%
+  group_by(configuration, Choose_GL, Size) %>%
+  summarise(mean_RT = mean(RT, na.rm = TRUE), se_RT = sd(RT, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop")
+
+# RT for Positive pairs by Presentation × Predicate × Size
+d_sce %>%
+  filter(Comparison_Type == "Positive") %>%
+  group_by(Presentation, Choose_GL, Size) %>%
+  summarise(mean_RT = mean(RT, na.rm = TRUE), se_RT = sd(RT, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop")
+```
+
+```{r sce-inferential-group}
+# ---- Group-level LMERs: RT ~ Size × Predicate × Order × Presentation ----
+
+d_sce <- d_sce %>%
+  mutate(
+    Size_C      = varRecode(Size, c("Small", "Large"), c(-.5, .5)),
+    Predicate_C = varRecode(Choose_GL, c("Greater", "Lesser"), c(-.5, .5)),
+    Order       = varRecode(configuration, config_levels, order_vals),
+    Presentation = varRecode(configuration, config_levels, present_vals)
+  )
+
+## Positive pairs
+d_pos_sce <- filter(d_sce, Comparison_Type == "Positive")
+
+m_pos_sce <- lmer(
+  RT ~ Size_C * Predicate_C * Order * Presentation +
+    (1 + Size_C:Predicate_C:Order | SubID),
+  data    = d_pos_sce,
+  control = lmerControl(optimizer = "bobyqa",
+                        optCtrl   = list(maxfun = 2e6),
+                        check.nobs.vs.nRE = "ignore")
+)
+anova(as_lmerModLmerTest(m_pos_sce))
+summary(m_pos_sce)
+
+# Simple effect: simultaneous
+d_pos_sim <- filter(d_pos_sce, Presentation == .5)
+m_pos_sim <- lmer(
+  RT ~ Size_C * Predicate_C * Order + (1 + Size_C:Predicate_C:Order | SubID),
+  data    = d_pos_sim,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e6),
+                        check.nobs.vs.nRE = "ignore")
+)
+anova(as_lmerModLmerTest(m_pos_sim))
+summary(m_pos_sim)
+
+# Simple effect: sequential
+d_pos_seq <- filter(d_pos_sce, Presentation == -.5)
+m_pos_seq <- lmer(
+  RT ~ Size_C * Predicate_C * Order + (1 + Size_C:Predicate_C:Order | SubID),
+  data    = d_pos_seq,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e6),
+                        check.nobs.vs.nRE = "ignore")
+)
+anova(as_lmerModLmerTest(m_pos_seq))
+summary(m_pos_seq)
+
+## Negative pairs — omnibus
+d_neg_sce <- filter(d_sce, Comparison_Type == "Negative")
+
+m_neg_sce <- lmer(
+  RT ~ Size_C * Predicate_C * Order * Presentation +
+    (1 + Size_C:Predicate_C:Order | SubID),
+  data    = d_neg_sce,
+  control = lmerControl(optimizer = "bobyqa",
+                        optCtrl   = list(maxfun = 2e6),
+                        check.nobs.vs.nRE = "ignore")
+)
+anova(as_lmerModLmerTest(m_neg_sce))
+summary(m_neg_sce)
+
+# Negative pairs — simple effects (same re-parametrization logic as distance models)
+d_neg_sce$Order_SI        <- varRecode(d_neg_sce$Order,        c(-.5, .5), c(-1, 0))
+d_neg_sce$Presentation_SI <- varRecode(d_neg_sce$Presentation, c(-.5, .5), c(-1, 0))
+m_neg_SI <- lmer(
+  RT ~ Size_C * Predicate_C * Order_SI * Presentation_SI +
+    (1 + Size_C:Predicate_C:Order_SI | SubID),
+  data    = d_neg_sce,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e6),
+                        check.nobs.vs.nRE = "ignore")
+)
+summary(m_neg_SI)
+anova(as_lmerModLmerTest(m_neg_SI))
+
+d_neg_sce$Order_SB        <- varRecode(d_neg_sce$Order,        c(-.5, .5), c(0, 1))
+d_neg_sce$Presentation_SB <- varRecode(d_neg_sce$Presentation, c(-.5, .5), c(-1, 0))
+m_neg_SB <- lmer(
+  RT ~ Size_C * Predicate_C * Order_SB * Presentation_SB +
+    (1 + Size_C:Predicate_C:Order_SB | SubID),
+  data    = d_neg_sce,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e6),
+                        check.nobs.vs.nRE = "ignore")
+)
+summary(m_neg_SB)
+anova(as_lmerModLmerTest(m_neg_SB))
+
+d_neg_sce$Order_SQI        <- varRecode(d_neg_sce$Order,        c(-.5, .5), c(-1, 0))
+d_neg_sce$Presentation_SQI <- varRecode(d_neg_sce$Presentation, c(-.5, .5), c(0, 1))
+m_neg_SQI <- lmer(
+  RT ~ Size_C * Predicate_C * Order_SQI * Presentation_SQI +
+    (1 + Size_C:Predicate_C:Order_SQI | SubID),
+  data    = d_neg_sce,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e6),
+                        check.nobs.vs.nRE = "ignore")
+)
+summary(m_neg_SQI)
+
+d_neg_sce$Order_SQB        <- varRecode(d_neg_sce$Order,        c(-.5, .5), c(0, 1))
+d_neg_sce$Presentation_SQB <- varRecode(d_neg_sce$Presentation, c(-.5, .5), c(0, 1))
+m_neg_SQB <- lmer(
+  RT ~ Size_C * Predicate_C * Order_SQB * Presentation_SQB +
+    (1 + Size_C:Predicate_C:Order_SQB | SubID),
+  data    = d_neg_sce,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e6),
+                        check.nobs.vs.nRE = "ignore")
+)
+summary(m_neg_SQB)
+anova(as_lmerModLmerTest(m_neg_SQB))
+```
+
+```{r sce-inferential-individual}
+# ---- Individual-level SCE ----
+# Per-participant OLS: RT ~ Predicate_C:Size_C
+# Classifies participants as Inverse / Standard / None using ±0.25 SD threshold
+
+extract_sce_betas <- function(df) {
+  results <- data.frame(
+    SubID    = character(),
+    beta_SCE = numeric(),
+    p_value  = numeric(),
+    lower_CI = numeric(),
+    upper_CI = numeric(),
+    stringsAsFactors = FALSE
+  )
+  for (subj in unique(df$SubID)) {
+    subj_data <- filter(df, SubID == subj)
+    model     <- lm(RT ~ Predicate_C:Size_C, data = subj_data)
+    ci        <- confint(model, "Predicate_C:Size_C", level = 0.95)
+    results   <- rbind(results, data.frame(
+      SubID    = subj,
+      beta_SCE = coef(model)["Predicate_C:Size_C"],
+      p_value  = summary(model)$coefficients["Predicate_C:Size_C", "Pr(>|t|)"],
+      lower_CI = ci[1],
+      upper_CI = ci[2]
+    ))
+  }
+  return(results)
+}
+
+classify_sce <- function(df) {
+  threshold_above <-  0.25 * SD(df$beta_SCE)
+  threshold_below <- -0.25 * SD(df$beta_SCE)
+  df %>%
+    mutate(
+      SCE_.25 = case_when(
+        beta_SCE < threshold_below ~ "Inverse",
+        beta_SCE > threshold_above ~ "Standard",
+        TRUE                       ~ "None"
+      ),
+      SCE_.25 = factor(SCE_.25, levels = c("Inverse", "Standard", "None"))
+    )
+}
+
+## Positive pairs
+sce_pos <- classify_sce(extract_sce_betas(d_pos_sce))
+table(sce_pos$SCE_.25)
+
+## Negative pairs — overall
+sce_neg <- classify_sce(extract_sce_betas(d_neg_sce))
+table(sce_neg$SCE_.25)
+
+## Negative pairs — by condition
+sce_neg_by_cond <- map_dfr(conditions, function(cond) {
+  df_cond <- filter(d_neg_sce, configuration == cond)
+  classify_sce(extract_sce_betas(df_cond)) %>%
+    mutate(configuration = cond)
+})
+
+sce_neg_by_cond %>%
+  group_by(configuration) %>%
+  summarise(table = list(table(SCE_.25)), .groups = "drop") %>%
+  pull(table) %>%
+  setNames(conditions)
+
+## Proportion plots: SCE
+
+# Overall (Positive, Negative)
+sce_prop_overall <- data.frame(
+  Comparison = rep(c("a Positive", "b Negative"), each = 3),
+  Category   = rep(c("c None", "b Standard", "a Inverse"), times = 2),
+  Proportion = c(0.17, 0.46, 0.37,
+                 0.13, 0.63, 0.24)
+)
+
+ggplot(sce_prop_overall, aes(x = Comparison, y = Proportion, fill = Category)) +
+  geom_bar(position = "fill", stat = "identity", color = "black") +
+  geom_text(aes(label = scales::percent(Proportion, accuracy = 0.1)),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 3) +
+  labs(x = "Comparison Type", y = "Proportion") +
+  scale_fill_manual(values = c("#4F9E4D", "#6CD991", "#5D7C6A")) +
+  theme_bw(base_size = 14)
+
+# By condition (Negative pairs)
+sce_prop_cond <- data.frame(
+  Comparison = rep(
+    c("a Simultaneous-Intermixed", "b Simultaneous-Blocked",
+      "c Sequential-Intermixed",  "d Sequential-Blocked"),
+    each = 3
+  ),
+  Category   = rep(c("c None", "b Standard", "a Inverse"), times = 4),
+  Proportion = c(0.27, 0.40, 0.33,
+                 0.16, 0.67, 0.17,
+                 0.08, 0.42, 0.50,
+                 0.17, 0.58, 0.25)
+)
+
+ggplot(sce_prop_cond, aes(x = Comparison, y = Proportion, fill = Category)) +
+  geom_bar(position = "fill", stat = "identity", color = "black") +
+  geom_text(aes(label = scales::percent(Proportion, accuracy = 0.1)),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 3) +
+  labs(x = "Condition", y = "Proportion") +
+  scale_fill_manual(values = c("#4F9E4D", "#6CD991", "#5D7C6A")) +
+  theme_bw(base_size = 14)
+```
+
+---
+
+#### EXPLORATORY: EXECUTIVE FUNCTION ANALYSES
+
+```{r ef-working-memory}
+d_ef <- read.csv("/Users/vestnicholas/Documents/Projects/Integers/Dissertation/DATA/EF Analyses/EFData_20250628_adults.csv")
+
+d_ef$DE_.25_MixedAllCond <- varRecode(
+  d_ef$DE_.25_MixedAllCond,
+  c("Inverse", "None", "Standard"),
+  c("Reflection", "Components", "Extension")
+)
+d_ef$DE_.25_MixedAllCond <- factor(d_ef$DE_.25_MixedAllCond)
+
+# Working memory: median split
+d_ef$WM_C <- factor(
+  ifelse(d_ef$Mean_WM <= median(d_ef$Mean_WM, na.rm = TRUE), "-.5", ".5")
+)
+
+ct_wm <- table(d_ef$WM_C, d_ef$DE_.25_MixedAllCond)
+print(ct_wm)
+print(chisq.test(ct_wm))
+prop.table(ct_wm, margin = 1)
+
+wm_prop <- data.frame(
+  Comparison = rep(c("a Low Working Memory", "b High Working Memory"), each = 3),
+  Category   = rep(c("a Extension", "b Reflection", "c Components"), times = 2),
+  Proportion = c(0.33, 0.41, 0.26,
+                 0.42, 0.33, 0.25)
+)
+
+ggplot(wm_prop, aes(x = Comparison, y = Proportion, fill = Category)) +
+  geom_bar(position = "fill", stat = "identity", color = "black") +
+  geom_text(aes(label = scales::percent(Proportion, accuracy = 0.1)),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 3) +
+  labs(x = "Working Memory Group", y = "Proportion") +
+  scale_fill_manual(values = c("#FF0000", "#DC143C", "#8B0000")) +
+  theme_bw(base_size = 14)
+```
+
+```{r ef-inhibitory-control}
+d_ef <- read.csv("/Users/vestnicholas/Documents/Projects/Integers/Dissertation/DATA/EF Analyses/EFData_20250628_adults.csv")
+
+d_ef$DE_.25_MixedAllCond <- varRecode(
+  d_ef$DE_.25_MixedAllCond,
+  c("Inverse", "None", "Standard"),
+  c("Reflection", "Components", "Extension")
+)
+d_ef$DE_.25_MixedAllCond <- factor(d_ef$DE_.25_MixedAllCond)
+
+# Inhibitory control: median split (higher RT on incongruent = lower IC)
+d_ef$Mean_IC_C <- ifelse(
+  d_ef$Mean_IC_Incongruent >= median(d_ef$Mean_IC_Incongruent, na.rm = TRUE),
+  -.5, .5
+)
+
+ct_ic <- table(d_ef$Mean_IC_C, d_ef$DE_.25_MixedAllCond)
+print(ct_ic)
+print(chisq.test(ct_ic))
+prop.table(ct_ic, margin = 1)
+
+ic_prop <- data.frame(
+  Comparison = rep(c("a Low Inhibitory Control", "b High Inhibitory Control"), each = 3),
+  Category   = rep(c("a Extension", "b Reflection", "c Components"), times = 2),
+  Proportion = c(0.40, 0.36, 0.24,
+                 0.33, 0.37, 0.29)
+)
+
+ggplot(ic_prop, aes(x = Comparison, y = Proportion, fill = Category)) +
+  geom_bar(position = "fill", stat = "identity", color = "black") +
+  geom_text(aes(label = scales::percent(Proportion, accuracy = 0.1)),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 3) +
+  labs(x = "Inhibitory Control Group", y = "Proportion") +
+  scale_fill_manual(values = c("#FFD700", "#DAA520", "#B8860B")) +
+  theme_bw(base_size = 14)
+```
+
+```{r ef-cognitive-flexibility}
+d_ef <- read.csv("/Users/vestnicholas/Documents/Projects/Integers/Dissertation/DATA/EF Analyses/EFData_20250628_adults.csv")
+
+d_ef$DE_.25_MixedAllCond <- varRecode(
+  d_ef$DE_.25_MixedAllCond,
+  c("Inverse", "None", "Standard"),
+  c("Reflection", "Components", "Extension")
+)
+d_ef$DE_.25_MixedAllCond <- factor(d_ef$DE_.25_MixedAllCond)
+
+# Cognitive flexibility: median split (higher switch cost = lower CF)
+d_ef$Mean_CF_C <- ifelse(
+  d_ef$Mean_CF_Switch >= median(d_ef$Mean_CF_Switch, na.rm = TRUE),
+  -.5, .5
+)
+
+ct_cf <- table(d_ef$Mean_CF_C, d_ef$DE_.25_MixedAllCond)
+print(ct_cf)
+print(chisq.test(ct_cf))
+prop.table(ct_cf, margin = 1)
+
+cf_prop <- data.frame(
+  Comparison = rep(c("a Low Cognitive Flexibility", "b High Cognitive Flexibility"), each = 3),
+  Category   = rep(c("a Extension", "b Reflection", "c Components"), times = 2),
+  Proportion = c(0.35, 0.30, 0.35,
+                 0.37, 0.47, 0.16)
+)
+
+ggplot(cf_prop, aes(x = Comparison, y = Proportion, fill = Category)) +
+  geom_bar(position = "fill", stat = "identity", color = "black") +
+  geom_text(aes(label = scales::percent(Proportion, accuracy = 0.1)),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 3) +
+  labs(x = "Cognitive Flexibility Group", y = "Proportion") +
+  scale_fill_manual(values = c("#FFA500", "#FF7043", "#FFCC80")) +
+  theme_bw(base_size = 14)
+
+# Cognitive flexibility × representation change
+d_ef$Mean_CF_01    <- ifelse(d_ef$Mean_CF_Switch >= median(d_ef$Mean_CF_Switch, na.rm = TRUE),
+                             "Low", "High")
+d_ef$RepChange_STR <- varRecode(d_ef$RepChange, c(0, 1), c("No Change", "Yes Change"))
+
+ct_cf_change <- table(d_ef$Mean_CF_01, d_ef$RepChange_STR)
+print(ct_cf_change)
+print(chisq.test(ct_cf_change))
+prop.table(ct_cf_change, margin = 1)
+
+cf_change_prop <- data.frame(
+  Comparison = rep(c("a Low Cognitive Flexibility", "b High Cognitive Flexibility"), each = 2),
+  Category   = rep(c("a No Change", "b Yes Change"), times = 2),
+  Proportion = c(0.35, 0.65,
+                 0.37, 0.63)
+)
+
+ggplot(cf_change_prop, aes(
+  x = Comparison, y = Proportion,
+  pattern        = Category,
+  pattern_fill   = Category,
+  pattern_colour = Category
+)) +
+  geom_bar_pattern(
+    stat                    = "identity",
+    position                = "stack",
+    color                   = "black",
+    pattern_density         = 1.0,
+    pattern_spacing         = 0.05,
+    pattern_key_scale_factor = 0.6
+  ) +
+  scale_pattern_manual(values       = c("stripe", "stripe")) +
+  scale_pattern_fill_manual(values  = c("#FFA500", "#FF4500")) +
+  scale_pattern_colour_manual(values = c("white",  "white")) +
+  labs(x = "Cognitive Flexibility Group", y = "Proportion") +
+  theme_bw(base_size = 14)
+```
